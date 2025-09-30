@@ -4,11 +4,142 @@ import numpy as np
 from collections import defaultdict
 
 class WiredTableDetector:
+    DEFAULT_MAX_LONG_SIDE = 3840
+    DEFAULT_TEXT_CLASSIFICATION_RULES = {
+        'min_text_regions': 4,
+        'min_row_groups': 2,
+        'min_col_groups': 2,
+        'min_sequence_len': 2,
+        'min_table_coverage': 0.03,
+        'max_table_coverage': 0.8,
+        'dense_text_threshold': 0.6,
+        'sparse_text_threshold': 0.015,
+    }
     def __init__(self):
         """
         Unified table detection system combining fine line detection and table grouping
         """
-        pass
+        self._last_resize_info = None
+
+    def _load_and_resize_image(self, image_path, target_long_side):
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+
+        orig_height, orig_width = img.shape[:2]
+        max_side = max(orig_width, orig_height)
+
+        if target_long_side <= 0 or max_side <= target_long_side:
+            processed = img.copy()
+            scale_x = 1.0
+            scale_y = 1.0
+        else:
+            scale = target_long_side / max_side
+            new_width = max(1, int(round(orig_width * scale)))
+            new_height = max(1, int(round(orig_height * scale)))
+            processed = cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            scale_x = processed.shape[1] / orig_width
+            scale_y = processed.shape[0] / orig_height
+
+        resize_info = {
+            'orig_shape': (orig_height, orig_width),
+            'processed_shape': processed.shape[:2],
+            'scale_x': scale_x,
+            'scale_y': scale_y,
+            'target_long_side': target_long_side,
+        }
+
+        self._last_resize_info = resize_info
+        return img, processed, resize_info
+
+    @staticmethod
+    def _normalize_bbox(bbox, width, height):
+        if width <= 0 or height <= 0:
+            return [0.0, 0.0, 0.0, 0.0]
+        x1, y1, x2, y2 = bbox
+        return [
+            max(0.0, min(1.0, x1 / width)),
+            max(0.0, min(1.0, y1 / height)),
+            max(0.0, min(1.0, x2 / width)),
+            max(0.0, min(1.0, y2 / height)),
+        ]
+
+    @staticmethod
+    def _bbox_to_yolo(bbox, width, height):
+        if width <= 0 or height <= 0:
+            return {'cx': 0.0, 'cy': 0.0, 'w': 0.0, 'h': 0.0}
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        w = x2 - x1
+        h = y2 - y1
+        return {
+            'cx': max(0.0, min(1.0, cx / width)),
+            'cy': max(0.0, min(1.0, cy / height)),
+            'w': max(0.0, min(1.0, w / width)),
+            'h': max(0.0, min(1.0, h / height)),
+        }
+
+    def _augment_table_geometry(self, tables, resize_info):
+        if not tables:
+            return tables
+
+        scale_x = resize_info.get('scale_x', 1.0) or 1.0
+        scale_y = resize_info.get('scale_y', 1.0) or 1.0
+        orig_height, orig_width = resize_info.get('orig_shape', (1, 1))
+        processed_height, processed_width = resize_info.get('processed_shape', (orig_height, orig_width))
+
+        for table in tables:
+            bbox_processed = table['bbox']
+            x1p, y1p, x2p, y2p = bbox_processed
+
+            width_processed = max(1, x2p - x1p)
+            height_processed = max(1, y2p - y1p)
+            area_processed = width_processed * height_processed
+
+            table['bbox_processed'] = bbox_processed
+            table['width_processed'] = width_processed
+            table['height_processed'] = height_processed
+            table['area_processed'] = area_processed
+
+            x1 = int(round(x1p / scale_x))
+            y1 = int(round(y1p / scale_y))
+            x2 = int(round(x2p / scale_x))
+            y2 = int(round(y2p / scale_y))
+
+            x1 = max(0, min(orig_width - 1, x1)) if orig_width > 0 else 0
+            y1 = max(0, min(orig_height - 1, y1)) if orig_height > 0 else 0
+            x2 = max(0, min(orig_width, x2)) if orig_width > 0 else 0
+            y2 = max(0, min(orig_height, y2)) if orig_height > 0 else 0
+
+            if x2 <= x1:
+                x2 = min(orig_width, x1 + 1) if orig_width > 0 else x1 + 1
+            if y2 <= y1:
+                y2 = min(orig_height, y1 + 1) if orig_height > 0 else y1 + 1
+
+            width_original = max(1, x2 - x1)
+            height_original = max(1, y2 - y1)
+            area_original = width_original * height_original
+
+            table['bbox'] = [x1, y1, x2, y2]
+            table['width'] = width_original
+            table['height'] = height_original
+            table['area'] = area_original
+
+            table['bbox_norm'] = self._normalize_bbox(table['bbox'], orig_width, orig_height)
+            table['bbox_yolo'] = self._bbox_to_yolo(table['bbox'], orig_width, orig_height)
+            table['image_size'] = {
+                'original_width': orig_width,
+                'original_height': orig_height,
+                'processed_width': processed_width,
+                'processed_height': processed_height,
+            }
+            table['scale_factors'] = {
+                'scale_x': scale_x,
+                'scale_y': scale_y,
+            }
+
+        return tables
     
     def _preprocess_for_fine_lines(self, gray_image):
         """
@@ -189,6 +320,72 @@ class WiredTableDetector:
             if not too_close_to_edge:
                 filtered.append(rect)
         
+        return filtered
+
+    def _is_valid_rectangular_contour(self, contour, min_rectangularity=0.85):
+        """Check if contour is sufficiently rectangular (avoid triangles/irregular shapes)."""
+        if contour is None or len(contour) < 3:
+            return False
+
+        x, y, w, h = cv2.boundingRect(contour)
+        rect_area = w * h
+        if rect_area == 0:
+            return False
+
+        contour_area = cv2.contourArea(contour)
+        extent = contour_area / rect_area
+
+        return extent >= min_rectangularity
+
+    def _validate_rectangle_shape(self, rect, binary_image, min_rectangularity=0.85):
+        """Validate if detected rectangle is actually rectangular (not triangular)."""
+        x1, y1, x2, y2 = rect['bbox']
+
+        h, w = binary_image.shape
+        x1 = max(0, min(w - 1, int(x1))) if w > 0 else 0
+        y1 = max(0, min(h - 1, int(y1))) if h > 0 else 0
+        x2 = max(0, min(w, int(x2))) if w > 0 else 0
+        y2 = max(0, min(h, int(y2))) if h > 0 else 0
+
+        if x2 <= x1 or y2 <= y1:
+            return False
+
+        region = binary_image[y1:y2, x1:x2]
+        if region.size == 0:
+            return False
+
+        contours, _ = cv2.findContours(region, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return False
+
+        largest_contour = max(contours, key=cv2.contourArea)
+        is_rectangular = self._is_valid_rectangular_contour(largest_contour, min_rectangularity)
+
+        if not is_rectangular:
+            lx, ly, lw, lh = cv2.boundingRect(largest_contour)
+            rect_area = lw * lh
+            contour_area = cv2.contourArea(largest_contour)
+            extent = contour_area / rect_area if rect_area > 0 else 0
+
+        return is_rectangular
+
+    def _filter_non_rectangular_shapes(self, rectangles, binary_image, min_rectangularity=0.85):
+        """Filter out triangular and irregular shapes, keep only rectangular tables."""
+        if not rectangles:
+            return rectangles
+
+        filtered = []
+        filtered_count = 0
+
+        for rect in rectangles:
+            if self._validate_rectangle_shape(rect, binary_image, min_rectangularity):
+                filtered.append(rect)
+            else:
+                filtered_count += 1
+
+        if filtered_count > 0:
+            print(f"Filtered {filtered_count} non-rectangular shapes (triangles, etc)")
+
         return filtered
     
     def _rectangles_adjacent(self, rect1, rect2, tolerance=10):
@@ -422,7 +619,8 @@ class WiredTableDetector:
                 'sub_rectangles_count': sub_count,
                 'table_type': table_type,
                 'merged_from': main_table.get('merged_from', []),
-                'confidence': min(1.0, sub_count / 10)  # Simple confidence score
+                'confidence': min(1.0, sub_count / 10),  # Simple confidence score
+                'content_type': 'unclassified'
             }
             
             final_tables.append(final_table)
@@ -454,7 +652,7 @@ class WiredTableDetector:
         
         Args:
             final_tables: list of detected tables
-            min_size_threshold: minimum area threshold - can be:
+            min_size_threshold: minimum area threshold for keeping simple rectangles:
                               - int/float > 1: absolute pixel area (e.g., 5000)
                               - float <= 1: percentage of image area (e.g., 0.01 = 1%)
             image_area: total image area for percentage calculation
@@ -468,7 +666,7 @@ class WiredTableDetector:
             if image_area is None:
                 raise ValueError("image_area required for percentage-based min_size_threshold")
             actual_threshold = image_area * min_size_threshold
-            print(f"Using {min_size_threshold:.1%} of image area as threshold: {actual_threshold:.0f} pixels")
+            print(f"Using {min_size_threshold:.3%} of image area as threshold: ")
         else:
             # Absolute pixel mode
             actual_threshold = min_size_threshold
@@ -486,9 +684,106 @@ class WiredTableDetector:
                 filtered_count += 1
         
         if filtered_count > 0:
-            print(f"Filtered out {filtered_count} small simple rectangles")
+            print(f"Filtered out <{filtered_count}> small simple rectangles")
         
         return filtered_tables
+
+    def _merge_nearby_small_regions(self, tables, image_area=None, area_ratio_threshold=0.05, distance_threshold_ratio=0.02):
+        """Merge nearby small tables into a minimal rectangle when close to each other."""
+        if not tables:
+            return tables
+
+        if image_area is None:
+            image_area = 0
+
+        area_threshold = image_area * area_ratio_threshold if image_area else None
+
+        large_tables = []
+        small_tables = []
+
+        for table in tables:
+            area = table.get('area', 0)
+            if area_threshold is not None and area < area_threshold:
+                small_tables.append(table)
+            else:
+                large_tables.append(table)
+
+        if not small_tables:
+            return tables
+
+        groups = []
+        visited = set()
+
+        def bbox_distance(bbox1, bbox2):
+            x11, y11, x12, y12 = bbox1
+            x21, y21, x22, y22 = bbox2
+
+            dx = max(0, max(x21 - x12, x11 - x22))
+            dy = max(0, max(y21 - y12, y11 - y22))
+            return (dx ** 2 + dy ** 2) ** 0.5
+
+        # Estimate scale for distance threshold (using image diagonal)
+        if image_area and tables:
+            sample_table = tables[0]
+            size_info = sample_table.get('image_size') or {}
+            width = size_info.get('original_width')
+            height = size_info.get('original_height')
+            if width and height:
+                diag = (width ** 2 + height ** 2) ** 0.5
+                distance_threshold = diag * distance_threshold_ratio
+            else:
+                distance_threshold = 50
+        else:
+            distance_threshold = 50
+
+        for idx, table in enumerate(small_tables):
+            if idx in visited:
+                continue
+            group = [table]
+            visited.add(idx)
+
+            for jdx, other in enumerate(small_tables[idx + 1:], start=idx + 1):
+                if jdx in visited:
+                    continue
+                dist = bbox_distance(table['bbox'], other['bbox'])
+                if dist <= distance_threshold:
+                    group.append(other)
+                    visited.add(jdx)
+
+            groups.append(group)
+
+        merged_tables = []
+
+        for group in groups:
+            if len(group) == 1:
+                merged_tables.append(group[0])
+                continue
+
+            x1 = min(t['bbox'][0] for t in group)
+            y1 = min(t['bbox'][1] for t in group)
+            x2 = max(t['bbox'][2] for t in group)
+            y2 = max(t['bbox'][3] for t in group)
+
+            merged_table = group[0].copy()
+            merged_table['bbox'] = [x1, y1, x2, y2]
+            merged_table['width'] = max(1, x2 - x1)
+            merged_table['height'] = max(1, y2 - y1)
+            merged_table['area'] = merged_table['width'] * merged_table['height']
+            merged_table['sub_rectangles_count'] = sum(t.get('sub_rectangles_count', 1) for t in group)
+            merged_table['merged_small_regions'] = [t.get('id') for t in group]
+
+            size_info = merged_table.get('image_size')
+            if size_info:
+                orig_w = size_info.get('original_width')
+                orig_h = size_info.get('original_height')
+                if orig_w and orig_h:
+                    merged_table['bbox_norm'] = self._normalize_bbox(merged_table['bbox'], orig_w, orig_h)
+                    merged_table['bbox_yolo'] = self._bbox_to_yolo(merged_table['bbox'], orig_w, orig_h)
+
+            merged_tables.append(merged_table)
+
+        # Merge final result: large tables + merged small groups
+        return large_tables + merged_tables
     
     def _visualize_results(self, img, final_tables, save_path='table_detection_result.jpg'):
         """
@@ -530,11 +825,126 @@ class WiredTableDetector:
         
         cv2.imwrite(save_path, img_vis)
         return img_vis
-    
-    def detect_tables(self, image_path, merge_tolerance=15, max_area_ratio=0.8, 
+
+    def _show_all_rectangles_debug(self, image_path, *,
+                                   min_area=50,
+                                   small_area_ratio=0.02,
+                                   target_long_side=None,
+                                   save_path='all_rectangles_debug.jpg',
+                                   draw_ids=True,
+                                   max_rectangles_visualize=1500):
+        """Debug helper: show and export all initially detected rectangles and highlight "small rectangles".
+
+        Parameters:
+            image_path: input image path
+            min_area: minimum area passed to _find_all_rectangles
+            small_area_ratio: threshold to consider a rectangle "small" (fraction of processed image area)
+            target_long_side: processing long side (defaults to class default)
+            save_path: output debug image path
+            draw_ids: whether to draw rectangle IDs
+            max_rectangles_visualize: avoid drawing too many rectangles in extreme cases
+
+        Returns:
+            dict containing:
+                'rectangles': list of all rectangles
+                'small_rectangles': list of small rectangles
+                'save_path': saved file path
+                'resize_info': resize information
+                'small_area_threshold': area threshold (pixels)
+        """
+        import cv2
+        import numpy as np
+
+        if target_long_side is None:
+            target_long_side = self.DEFAULT_MAX_LONG_SIDE
+
+        # 1. Load and resize
+        original_img, processed_img, resize_info = self._load_and_resize_image(image_path, target_long_side)
+        gray = cv2.cvtColor(processed_img, cv2.COLOR_BGR2GRAY)
+
+        ph, pw = processed_img.shape[:2]
+        processed_area = ph * pw
+        small_area_threshold = processed_area * small_area_ratio
+
+        # 2. Preprocess, detect lines, and get initial rectangles
+        binary = self._preprocess_for_fine_lines(gray)
+        h_lines, v_lines = self._detect_lines_multi_scale(binary)
+        rectangles = self._find_all_rectangles(h_lines, v_lines, min_area)
+
+        if not rectangles:
+            print("[debug] No initial rectangles detected")
+            return {
+                'rectangles': [],
+                'small_rectangles': [],
+                'save_path': None,
+                'resize_info': resize_info,
+                'small_area_threshold': small_area_threshold,
+            }
+
+        # 3. Mark small rectangles
+        small_rectangles = []
+        for r in rectangles:
+            r_area = r.get('area')
+            if r_area is None:
+                x1, y1, x2, y2 = r['bbox']
+                r_area = (x2 - x1) * (y2 - y1)
+                r['area'] = r_area
+            if r_area < small_area_threshold:
+                r['__is_small'] = True
+                small_rectangles.append(r)
+            else:
+                r['__is_small'] = False
+
+        # 4. Visualization
+        vis = processed_img.copy()
+
+        # Limit visualization count (sort by area, show smallest first)
+        to_draw = sorted(rectangles, key=lambda x: x['area'])
+        if len(to_draw) > max_rectangles_visualize:
+            print(f"[debug] Too many rectangles ({len(to_draw)}), truncating to first {max_rectangles_visualize} for visualization")
+            to_draw = to_draw[:max_rectangles_visualize]
+
+        for rect in to_draw:
+            x1, y1, x2, y2 = rect['bbox']
+            is_small = rect['__is_small']
+            color = (0, 255, 255) if is_small else (160, 160, 160)
+            thickness = 2 if is_small else 1
+            cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
+            if draw_ids:
+                rid = rect.get('id')
+                if rid is not None:
+                    label = f"{rid}:{int(rect['area'])}"
+                    cv2.putText(vis, label[:18], (x1+2, max(12, y1+12)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+        legend_lines = [
+            f"Total rects: {len(rectangles)}",
+            f"Small rects(<{small_area_ratio*100:.2f}% area): {len(small_rectangles)}",
+            f"Processed size: {pw}x{ph}",
+        ]
+        y0 = 20
+        for line in legend_lines:
+            cv2.putText(vis, line, (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
+            y0 += 24
+
+        cv2.imwrite(save_path, vis)
+        print(f"[debug] All initial rectangles debug image saved: {save_path}")
+
+        return {
+            'rectangles': rectangles,
+            'small_rectangles': small_rectangles,
+            'save_path': save_path,
+            'resize_info': resize_info,
+            'small_area_threshold': small_area_threshold,
+        }
+
+    def detect_tables(self, image_path, merge_tolerance=15, max_area_ratio=0.8, max_merge_passes=2,
                      min_area=50, save_visualization=True, filter_edge_rectangles=True,
                      edge_margin_ratio=0.01, path='table_detection_result.jpg', 
-                     filter_small_simple=True, min_size_threshold=5000):
+                     filter_small_simple=True, min_size_threshold=5000,
+                     filter_non_rectangular=True, min_rectangularity=0.85,
+                     merge_small_regions=True, small_region_area_ratio=0.05,
+                     small_region_distance_ratio=0.02,
+                     target_long_side=None):
         """
         Main public interface - detect all tables in image
         
@@ -551,18 +961,28 @@ class WiredTableDetector:
             min_size_threshold: minimum area threshold for keeping simple rectangles:
                               - int/float > 1: absolute pixel area (e.g., 5000)
                               - float <= 1: percentage of image area (e.g., 0.01 = 1%)
+            filter_non_rectangular: whether to reject triangular/irregular contours before merging.
+            min_rectangularity: minimum contour extent to accept a rectangle (default: 0.85).
+            merge_small_regions: whether to merge nearby small tables into minimal bounding boxes.
+            small_region_area_ratio: area ratio threshold (of image) that defines "small" tables.
+            small_region_distance_ratio: proximity threshold (relative to image diagonal) for merging.
+            target_long_side: max dimension (long side) for processing resolution; defaults to 4K (3840).
             
         Returns:
             list of detected tables with metadata
         """
-        # Read image
-        img = cv2.imread(image_path)
-        if img is None:
-            raise ValueError(f"Could not load image: {image_path}")
-        
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        image_area = img.shape[0] * img.shape[1]  # Calculate total image area
-        print(f"Processing image of size: ({image_area} pixels)")
+        if target_long_side is None:
+            target_long_side = self.DEFAULT_MAX_LONG_SIDE
+
+        original_img, processed_img, resize_info = self._load_and_resize_image(image_path, target_long_side)
+        gray = cv2.cvtColor(processed_img, cv2.COLOR_BGR2GRAY)
+
+        proc_height, proc_width = processed_img.shape[:2]
+        image_area = proc_height * proc_width
+        print(
+            f"Processing image (original {original_img.shape[1]}x{original_img.shape[0]} -> "
+            f"processed {proc_width}x{proc_height})"
+        )
         # Step 1: Preprocess for fine line detection
         binary = self._preprocess_for_fine_lines(gray)
         
@@ -577,13 +997,18 @@ class WiredTableDetector:
         
         # Step 4a: Filter oversized rectangles (BEFORE merging)
         filtered_rectangles = self._filter_oversized_rectangles(
-            rectangles, img.shape[:2], max_area_ratio
+            rectangles, processed_img.shape[:2], max_area_ratio
         )
         
         # Step 4b: Filter edge rectangles if enabled
         if filter_edge_rectangles:
             filtered_rectangles = self._filter_edge_rectangles(
-                filtered_rectangles, img.shape[:2], edge_margin_ratio
+                filtered_rectangles, processed_img.shape[:2], edge_margin_ratio
+            )
+
+        if filter_non_rectangular:
+            filtered_rectangles = self._filter_non_rectangular_shapes(
+                filtered_rectangles, binary, min_rectangularity
             )
         
         if not filtered_rectangles:
@@ -591,7 +1016,7 @@ class WiredTableDetector:
         
         # Step 5: Smart merge with size validation - run multiple passes if needed
         merged_rectangles = filtered_rectangles
-        max_merge_passes = 3  # Limit merge passes to avoid infinite loops
+        # Limit merge passes to avoid infinite loops
         
         for pass_num in range(max_merge_passes):
             before_count = len(merged_rectangles)
@@ -601,7 +1026,7 @@ class WiredTableDetector:
             current_max_area = max_area_ratio + (0.1 * pass_num)
             
             merged_rectangles = self._merge_adjacent_rectangles_with_size_check(
-                merged_rectangles, current_tolerance, img.shape[:2], current_max_area
+                merged_rectangles, current_tolerance, processed_img.shape[:2], current_max_area
             )
             
             after_count = len(merged_rectangles)
@@ -623,11 +1048,22 @@ class WiredTableDetector:
         # Step 8: Filter small simple rectangles if enabled
         if filter_small_simple:
             final_tables = self._filter_small_simple_rectangles(final_tables, min_size_threshold, image_area)
-        
-        # Step 9: Visualize results
+
+        if merge_small_regions:
+            final_tables = self._merge_nearby_small_regions(
+                final_tables,
+                image_area=image_area,
+                area_ratio_threshold=small_region_area_ratio,
+                distance_threshold_ratio=small_region_distance_ratio
+            )
+
+        # Step 9: Normalize geometry back to original resolution and percentages
+        final_tables = self._augment_table_geometry(final_tables, resize_info)
+
+        # Step 10: Visualize results on original resolution
         if save_visualization:
-            self._visualize_results(img, final_tables, path)
-        
+            self._visualize_results(original_img, final_tables, path)
+
         return final_tables
 
     def export_tables(self, tables, save_path, include_sub_rectangles=False):
@@ -648,16 +1084,35 @@ class WiredTableDetector:
             record = {
                 'id': table['id'],
                 'bbox': table['bbox'],
+                'bbox_norm': [round(v, 6) for v in table.get('bbox_norm', [])] if table.get('bbox_norm') else None,
+                'bbox_yolo': {k: round(v, 6) for k, v in table.get('bbox_yolo', {}).items()} if table.get('bbox_yolo') else None,
+                'bbox_processed': table.get('bbox_processed'),
                 'width': table['width'],
                 'height': table['height'],
+                'width_processed': table.get('width_processed'),
+                'height_processed': table.get('height_processed'),
                 'area': table['area'],
                 'table_type': table.get('table_type'),
                 'sub_rectangles_count': table.get('sub_rectangles_count', 0),
-                'confidence': table.get('confidence', 0.0)
+                'confidence': table.get('confidence', 0.0),
+                'content_type': table.get('content_type'),
+                'image_size': table.get('image_size'),
+                'scale_factors': table.get('scale_factors'),
             }
+
+            if record['bbox_norm'] is None:
+                record.pop('bbox_norm')
+            if record['bbox_yolo'] is None:
+                record.pop('bbox_yolo')
 
             if include_sub_rectangles:
                 record['merged_from'] = table.get('merged_from', [])
+
+            summary = table.get('text_summary')
+            if summary:
+                record['text_overlap_ratio'] = round(summary.get('text_coverage', 0.0), 4)
+                record['alignment_score'] = summary.get('alignment_score')
+                record['text_count'] = summary.get('text_count')
 
             payload.append(record)
 
@@ -666,11 +1121,155 @@ class WiredTableDetector:
 
         return save_path
 
+    def _compute_frame_text_summary(self, table, frame_info, config):
+        bbox = table.get('bbox', [0, 0, 0, 0])
+        x1, y1, x2, y2 = bbox
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        frame_area = float(width * height)
+
+        text_regions = [r for r in frame_info.get('text_regions', [])
+                        if isinstance(r, dict) and r.get('bbox')]
+
+        text_area = 0.0
+        text_widths = []
+        text_heights = []
+
+        for region in text_regions:
+            rx1, ry1, rx2, ry2 = region['bbox']
+            rw = max(0, rx2 - rx1)
+            rh = max(0, ry2 - ry1)
+            text_area += rw * rh
+            text_widths.append(rw)
+            text_heights.append(rh)
+
+        coverage = text_area / frame_area if frame_area > 0 else 0.0
+
+        alignment = frame_info.get('alignment') or {}
+        rows = alignment.get('rows') or []
+        columns = alignment.get('columns') or []
+
+        row_count = frame_info.get('row_count', len(rows))
+        column_count = frame_info.get('column_count', len(columns))
+        max_row_len = max((len(row) for row in rows), default=0)
+        max_col_len = max((len(col) for col in columns), default=0)
+
+        row_sequences = sum(1 for row in rows if len(row) >= config['min_sequence_len'])
+        column_sequences = sum(1 for col in columns if len(col) >= config['min_sequence_len'])
+
+        text_count = frame_info.get('text_count', len(text_regions))
+
+        has_horizontal = max_row_len >= config['min_sequence_len']
+        has_vertical = max_col_len >= config['min_sequence_len']
+
+        dense_text = coverage >= config['dense_text_threshold']
+        sparse_text = (coverage <= config['sparse_text_threshold'] or
+                       text_count < config['min_text_regions'])
+
+        alignment_ok = (row_count >= config['min_row_groups'] and
+                        column_count >= config['min_col_groups'])
+        sequence_ok = has_horizontal and has_vertical
+        coverage_ok = (config['min_table_coverage'] <= coverage <= config['max_table_coverage'])
+
+        if alignment_ok and sequence_ok and coverage_ok:
+            classification = 'table'
+        elif sparse_text:
+            classification = 'frame_outline'
+        elif dense_text and not alignment_ok:
+            classification = 'text_block'
+        else:
+            classification = 'ambiguous_frame'
+
+        summary = {
+            'text_count': text_count,
+            'row_count': row_count,
+            'column_count': column_count,
+            'row_sequence_count': row_sequences,
+            'column_sequence_count': column_sequences,
+            'max_row_length': max_row_len,
+            'max_column_length': max_col_len,
+            'text_area': float(text_area),
+            'frame_area': frame_area,
+            'text_coverage': coverage,
+            'alignment_score': min(row_count, column_count),
+            'has_horizontal_sequence': has_horizontal,
+            'has_vertical_sequence': has_vertical,
+            'dense_text': dense_text,
+            'sparse_text': sparse_text,
+            'classification': classification,
+        }
+
+        if text_widths:
+            summary['avg_text_width'] = float(np.mean(text_widths))
+            summary['avg_text_height'] = float(np.mean(text_heights))
+        else:
+            summary['avg_text_width'] = 0.0
+            summary['avg_text_height'] = 0.0
+
+        summary['text_density'] = (text_count / frame_area) if frame_area > 0 else 0.0
+
+        return summary
+
+    def _attach_text_metrics_to_tables(self, tables, frame_analysis, config):
+        frame_lookup = {}
+
+        for info in frame_analysis:
+            frame_id = info.get('frame_id')
+            if frame_id is None:
+                frame = info.get('frame')
+                if isinstance(frame, dict):
+                    frame_id = frame.get('id')
+            if frame_id is not None:
+                frame_lookup[frame_id] = info
+
+        for table in tables:
+            table_id = table.get('id')
+            frame_info = frame_lookup.get(table_id)
+
+            if frame_info is None:
+                bbox = table.get('bbox', [0, 0, 0, 0])
+                x1, y1, x2, y2 = bbox
+                frame_area = float(max(1, x2 - x1) * max(1, y2 - y1))
+                summary = {
+                    'text_count': 0,
+                    'row_count': 0,
+                    'column_count': 0,
+                    'row_sequence_count': 0,
+                    'column_sequence_count': 0,
+                    'max_row_length': 0,
+                    'max_column_length': 0,
+                    'text_area': 0.0,
+                    'frame_area': frame_area,
+                    'text_coverage': 0.0,
+                    'alignment_score': 0,
+                    'has_horizontal_sequence': False,
+                    'has_vertical_sequence': False,
+                    'dense_text': False,
+                    'sparse_text': True,
+                    'classification': 'unmatched'
+                }
+                summary['avg_text_width'] = 0.0
+                summary['avg_text_height'] = 0.0
+                summary['text_density'] = 0.0
+                table['text_summary'] = summary
+                table['content_type'] = table.get('content_type', 'unclassified')
+                continue
+
+            summary = self._compute_frame_text_summary(table, frame_info, config)
+            table['text_summary'] = summary
+            table['content_type'] = summary['classification']
+            frame_info['text_summary'] = summary
+            frame_info['content_type'] = summary['classification']
+
+        return tables
+
     def detect_tables_with_text(self, image_path, text_detector, *,
                                 text_method='all', min_quality_score=0.3,
                                 alignment_tolerance=20, assignment_method='center',
                                 overlap_threshold=0.1, min_regions=2,
-                                return_unassigned=True, text_kwargs=None, **table_kwargs):
+                                return_unassigned=True, text_kwargs=None,
+                                classification_rules=None, filter_non_tables=False,
+                                **table_kwargs):
         """Detect wired tables and analyze text within each frame to reduce text-level complexity.
 
         Args:
@@ -684,6 +1283,8 @@ class WiredTableDetector:
             min_regions: minimum region count required to run alignment inside a frame.
             return_unassigned: whether to include text regions that didn't match any frame.
             text_kwargs: optional dict forwarded to ``analyze_text_within_frames`` (e.g., custom params).
+            classification_rules: optional overrides for text-based table classification thresholds.
+            filter_non_tables: when True, only keep candidates classified as real tables.
             **table_kwargs: forwarded to ``detect_tables`` (e.g., merge_tolerance, save_visualization).
 
         Returns:
@@ -692,17 +1293,23 @@ class WiredTableDetector:
                 'text_regions': list of all text regions detected
                 'frame_text': per-frame analysis structure from ``analyze_text_within_frames``
         """
+        target_long_side = table_kwargs.get('target_long_side', None)
         tables = self.detect_tables(image_path, **table_kwargs)
 
         if not tables:
             return {
                 'tables': [],
                 'text_regions': [],
-                'frame_text': {'frames': [], 'unassigned_regions': []}
+                'frame_text': {'frames': [], 'unassigned_regions': []},
+                'meta': {'resize_info': self._last_resize_info}
             }
 
         text_regions = text_detector.extract_text_regions(
-            image_path, min_quality_score=min_quality_score, method=text_method
+            image_path,
+            min_quality_score=min_quality_score,
+            method=text_method,
+            target_long_side=target_long_side or self.DEFAULT_MAX_LONG_SIDE,
+            resize_info=self._last_resize_info
         )
 
         analysis_kwargs = {
@@ -713,6 +1320,8 @@ class WiredTableDetector:
         }
         if text_kwargs:
             analysis_kwargs.update(text_kwargs)
+        if self._last_resize_info:
+            analysis_kwargs['scale_factors'] = self._last_resize_info
 
         analysis = text_detector.analyze_text_within_frames(
             tables,
@@ -724,8 +1333,33 @@ class WiredTableDetector:
             analysis = analysis.copy()
             analysis['unassigned_regions'] = []
 
+        classification_config = self.DEFAULT_TEXT_CLASSIFICATION_RULES.copy()
+        if classification_rules:
+            classification_config.update(classification_rules)
+
+        tables = self._attach_text_metrics_to_tables(tables, analysis['frames'], classification_config)
+
+        if filter_non_tables:
+            tables = [table for table in tables if table.get('content_type') == 'table']
+            kept_ids = {table.get('id') for table in tables}
+            if kept_ids:
+                filtered_frames = []
+                for frame_info in analysis.get('frames', []):
+                    frame_id = frame_info.get('frame_id')
+                    if frame_id in kept_ids:
+                        filtered_frames.append(frame_info)
+                        continue
+                    frame = frame_info.get('frame')
+                    if isinstance(frame, dict) and frame.get('id') in kept_ids:
+                        filtered_frames.append(frame_info)
+                analysis = analysis.copy()
+                analysis['frames'] = filtered_frames
+
         return {
             'tables': tables,
             'text_regions': text_regions,
-            'frame_text': analysis
+            'frame_text': analysis,
+            'meta': {'resize_info': self._last_resize_info}
         }
+    
+    

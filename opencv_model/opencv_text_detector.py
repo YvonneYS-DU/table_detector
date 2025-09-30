@@ -2,15 +2,7 @@ import cv2
 import numpy as np
 """text_detect_open_cv
 =================================================
-字符 / 文本区域检测与（无框）表格定位辅助模块
 
-ZH 简介
---------
-本模块聚焦于“基于文本位置”来辅助检测无边框表格（borderless tables）。核心思想：
-1. 使用多种文本候选区域提取方法（MSER / 形态学 / 轮廓 / 增强轮廓）。
-2. 统一输出标准化的文本区域结构（bbox / center / confidence / method 等）。
-3. 对文本区域做质量过滤 + 去重 + 行列对齐分析。
-4. 通过行列交叉模式推断潜在的无框表格候选区域。
 
 EN Overview
 -----------
@@ -69,13 +61,125 @@ import numpy as np
 import re
 
 class TextPositionTableDetector:
+    DEFAULT_MAX_LONG_SIDE = 3840
+
     def __init__(self):
         """
         Table detector for borderless tables based on text position analysis
         """
-        pass
+        self._last_resize_info = None
+
+    def _load_image_with_resize(self, image_path, target_long_side, resize_info=None):
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+
+        orig_height, orig_width = img.shape[:2]
+
+        if resize_info is not None:
+            scale_x = resize_info.get('scale_x', 1.0) or 1.0
+            scale_y = resize_info.get('scale_y', 1.0) or 1.0
+            processed_width = max(1, int(round(orig_width * scale_x)))
+            processed_height = max(1, int(round(orig_height * scale_y)))
+            if processed_width == orig_width and processed_height == orig_height:
+                processed = img.copy()
+            else:
+                processed = cv2.resize(img, (processed_width, processed_height), interpolation=cv2.INTER_AREA)
+        else:
+            if target_long_side is None:
+                target_long_side = self.DEFAULT_MAX_LONG_SIDE
+            max_side = max(orig_width, orig_height)
+            if target_long_side <= 0 or max_side <= target_long_side:
+                processed = img.copy()
+                scale_x = 1.0
+                scale_y = 1.0
+            else:
+                scale = target_long_side / max_side
+                processed_width = max(1, int(round(orig_width * scale)))
+                processed_height = max(1, int(round(orig_height * scale)))
+                processed = cv2.resize(img, (processed_width, processed_height), interpolation=cv2.INTER_AREA)
+                scale_x = processed.shape[1] / orig_width
+                scale_y = processed.shape[0] / orig_height
+            resize_info = {
+                'orig_shape': (orig_height, orig_width),
+                'processed_shape': processed.shape[:2],
+                'scale_x': scale_x,
+                'scale_y': scale_y,
+                'target_long_side': target_long_side,
+            }
+
+        resize_info.setdefault('orig_shape', (orig_height, orig_width))
+        resize_info.setdefault('processed_shape', processed.shape[:2])
+        resize_info.setdefault('scale_x', processed.shape[1] / orig_width)
+        resize_info.setdefault('scale_y', processed.shape[0] / orig_height)
+        resize_info.setdefault('target_long_side', target_long_side)
+
+        self._last_resize_info = resize_info
+        return img, processed, resize_info
+
+    @staticmethod
+    def _clip_norm(value):
+        return max(0.0, min(1.0, value))
+
+    def _convert_regions_to_original_scale(self, regions, resize_info):
+        if not regions:
+            return regions
+
+        scale_x = resize_info.get('scale_x', 1.0) or 1.0
+        scale_y = resize_info.get('scale_y', 1.0) or 1.0
+        orig_height, orig_width = resize_info.get('orig_shape', (1, 1))
+
+        for region in regions:
+            bbox_processed = region.get('bbox')
+            center_processed = region.get('center')
+
+            if bbox_processed is None:
+                continue
+
+            x1p, y1p, x2p, y2p = bbox_processed
+
+            region['bbox_processed'] = bbox_processed
+            region['center_processed'] = center_processed
+
+            x1 = int(round(x1p / scale_x))
+            y1 = int(round(y1p / scale_y))
+            x2 = int(round(x2p / scale_x))
+            y2 = int(round(y2p / scale_y))
+
+            region['bbox'] = [x1, y1, x2, y2]
+            if center_processed is not None:
+                cx = center_processed[0] / scale_x
+                cy = center_processed[1] / scale_y
+                region['center'] = [cx, cy]
+            else:
+                region['center'] = [
+                    (x1 + x2) / 2.0,
+                    (y1 + y2) / 2.0,
+                ]
+
+            region['bbox_norm'] = [
+                self._clip_norm(region['bbox'][0] / orig_width),
+                self._clip_norm(region['bbox'][1] / orig_height),
+                self._clip_norm(region['bbox'][2] / orig_width),
+                self._clip_norm(region['bbox'][3] / orig_height),
+            ]
+            region['center_norm'] = [
+                self._clip_norm(region['center'][0] / orig_width),
+                self._clip_norm(region['center'][1] / orig_height),
+            ]
+            region['image_size'] = {
+                'original_width': orig_width,
+                'original_height': orig_height,
+            }
+            region['scale_factors'] = {
+                'scale_x': scale_x,
+                'scale_y': scale_y,
+            }
+
+        return regions
     
-    def _extract_text_regions(self, image_path, min_quality_score=0.3, method='mser'):
+    def _extract_text_regions(self, image_path, min_quality_score=0.3, method='mser',
+                               target_long_side=None, resize_info=None):
         """
         Extract text regions with configurable method selection to reduce computation
         
@@ -88,9 +192,17 @@ class TextPositionTableDetector:
             list of text regions with bbox and basic info
         """
         print(f"Extracting text regions from: {image_path}")
-        
-        img = cv2.imread(image_path)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        original_img, processed_img, resize_info = self._load_image_with_resize(
+            image_path,
+            target_long_side or self.DEFAULT_MAX_LONG_SIDE,
+            resize_info=resize_info
+        )
+
+        gray = cv2.cvtColor(processed_img, cv2.COLOR_BGR2GRAY)
+        print(
+            f"Text detection resize: original {original_img.shape[1]}x{original_img.shape[0]} -> "
+            f"processed {processed_img.shape[1]}x{processed_img.shape[0]}"
+        )
         
         # Select detection method based on parameter
         if method == 'mser':
@@ -115,11 +227,19 @@ class TextPositionTableDetector:
         filtered_regions = self._filter_regions_by_quality(all_regions, min_quality_score)
         
         print(f"Final result: {len(filtered_regions)} text regions after quality filtering")
+        filtered_regions = self._convert_regions_to_original_scale(filtered_regions, resize_info)
         return filtered_regions
 
-    def extract_text_regions(self, image_path, min_quality_score=0.3, method='mser'):
+    def extract_text_regions(self, image_path, min_quality_score=0.3, method='mser',
+                              target_long_side=None, resize_info=None):
         """Public wrapper around :meth:`_extract_text_regions`."""
-        return self._extract_text_regions(image_path, min_quality_score, method)
+        return self._extract_text_regions(
+            image_path,
+            min_quality_score=min_quality_score,
+            method=method,
+            target_long_side=target_long_side,
+            resize_info=resize_info,
+        )
     def _save_quality_debug(self, img, regions, filename):
         """
         Save debug image with quality-based color coding
@@ -673,13 +793,14 @@ class TextPositionTableDetector:
         
         return min(1.0, base_confidence)
     
-    def _analyze_text_alignment_fast(self, text_regions, alignment_tolerance=20):
+    def _analyze_text_alignment_fast(self, text_regions, alignment_tolerance=20, center_key='center'):
         """
         Fast text alignment analysis using sorted arrays instead of nested loops
         
         Args:
             text_regions: list of text regions
             alignment_tolerance: pixel tolerance for alignment detection
+            center_key: key to extract center coordinates from each region
             
         Returns:
             dict with row and column information
@@ -689,13 +810,24 @@ class TextPositionTableDetector:
         
         print(f"Fast alignment analysis of {len(text_regions)} regions...")
         
+        def get_center(region):
+            center = region.get(center_key)
+            if center is None:
+                center = region.get('center')
+            return center
+
+        regions_with_center = [region for region in text_regions if get_center(region) is not None]
+
+        if not regions_with_center:
+            return {'rows': [], 'columns': []}
+
         # Sort once and reuse for both row and column grouping
-        y_sorted = sorted(text_regions, key=lambda r: r['center'][1])
-        x_sorted = sorted(text_regions, key=lambda r: r['center'][0])
+        y_sorted = sorted(regions_with_center, key=lambda r: get_center(r)[1])
+        x_sorted = sorted(regions_with_center, key=lambda r: get_center(r)[0])
         
         # Fast grouping using sorted order
-        rows = self._group_sorted_regions(y_sorted, 1, alignment_tolerance)  # Group by Y
-        columns = self._group_sorted_regions(x_sorted, 0, alignment_tolerance)  # Group by X
+        rows = self._group_sorted_regions(y_sorted, 1, alignment_tolerance, center_key=center_key)  # Group by Y
+        columns = self._group_sorted_regions(x_sorted, 0, alignment_tolerance, center_key=center_key)  # Group by X
         
         # Filter groups with minimum elements
         rows = [row for row in rows if len(row) >= 2]
@@ -704,7 +836,7 @@ class TextPositionTableDetector:
         print(f"Fast alignment found {len(rows)} rows and {len(columns)} columns")
         return {'rows': rows, 'columns': columns}
     
-    def _group_sorted_regions(self, sorted_regions, coord_index, tolerance):
+    def _group_sorted_regions(self, sorted_regions, coord_index, tolerance, center_key='center'):
         """
         Group already-sorted regions by coordinate with single pass
         
@@ -712,6 +844,7 @@ class TextPositionTableDetector:
             sorted_regions: regions sorted by coordinate
             coord_index: 0 for X, 1 for Y
             tolerance: grouping tolerance
+            center_key: key to extract center coordinates
             
         Returns:
             list of groups
@@ -719,12 +852,18 @@ class TextPositionTableDetector:
         if not sorted_regions:
             return []
         
+        def coord(region):
+            center = region.get(center_key)
+            if center is None:
+                center = region.get('center')
+            return center[coord_index]
+
         groups = []
         current_group = [sorted_regions[0]]
-        current_coord = sorted_regions[0]['center'][coord_index]
+        current_coord = coord(sorted_regions[0])
         
         for region in sorted_regions[1:]:
-            region_coord = region['center'][coord_index]
+            region_coord = coord(region)
             
             if abs(region_coord - current_coord) <= tolerance:
                 current_group.append(region)
@@ -1135,9 +1274,23 @@ class TextPositionTableDetector:
                 raise ValueError("Each frame must provide a 'bbox' field [x1, y1, x2, y2].")
 
             frame_id = frame.get('id', f'frame_{idx}')
+            bbox_norm = frame.get('bbox_norm')
+            if bbox_norm is None and frame.get('image_size'):
+                size_info = frame['image_size']
+                width = size_info.get('original_width') or size_info.get('width')
+                height = size_info.get('original_height') or size_info.get('height')
+                if width and height:
+                    bbox_norm = [
+                        bbox[0] / width,
+                        bbox[1] / height,
+                        bbox[2] / width,
+                        bbox[3] / height,
+                    ]
             assignments.append({
                 'frame_id': frame_id,
                 'bbox': bbox,
+                'bbox_norm': bbox_norm,
+                'scale_factors': frame.get('scale_factors'),
                 'frame': frame,
                 'text_regions': []
             })
@@ -1147,23 +1300,37 @@ class TextPositionTableDetector:
         for region in text_regions:
             region_bbox = region.get('bbox')
             region_center = region.get('center')
+            region_bbox_norm = region.get('bbox_norm')
+            region_center_norm = region.get('center_norm')
             matched = False
 
             for entry in assignments:
+                frame_bbox_norm = entry.get('bbox_norm')
                 x1, y1, x2, y2 = entry['bbox']
 
                 if method == 'center':
-                    if region_center is None:
+                    if region_center is None and region_center_norm is None:
                         continue
-                    cx, cy = region_center
-                    if x1 <= cx <= x2 and y1 <= cy <= y2:
-                        entry['text_regions'].append(region)
-                        matched = True
-                        break
+                    if region_center_norm and frame_bbox_norm:
+                        cx, cy = region_center_norm
+                        fx1, fy1, fx2, fy2 = frame_bbox_norm
+                        if fx1 <= cx <= fx2 and fy1 <= cy <= fy2:
+                            entry['text_regions'].append(region)
+                            matched = True
+                            break
+                    else:
+                        cx, cy = region_center
+                        if x1 <= cx <= x2 and y1 <= cy <= y2:
+                            entry['text_regions'].append(region)
+                            matched = True
+                            break
                 else:
-                    if region_bbox is None:
+                    if region_bbox is None and region_bbox_norm is None:
                         continue
-                    overlap = self._calculate_overlap_ratio(region_bbox, entry['bbox'])
+                    if region_bbox_norm and frame_bbox_norm:
+                        overlap = self._calculate_overlap_ratio(region_bbox_norm, frame_bbox_norm)
+                    else:
+                        overlap = self._calculate_overlap_ratio(region_bbox, entry['bbox'])
                     if overlap >= overlap_threshold:
                         entry['text_regions'].append(region)
                         matched = True
@@ -1175,7 +1342,8 @@ class TextPositionTableDetector:
         return assignments, unassigned
 
     def analyze_text_within_frames(self, frames, text_regions, alignment_tolerance=20,
-                                   min_regions=2, method='center', overlap_threshold=0.1):
+                                   min_regions=2, method='center', overlap_threshold=0.1,
+                                   scale_factors=None):
         """Analyze text alignment inside each frame to reduce global complexity.
 
         Args:
@@ -1185,6 +1353,7 @@ class TextPositionTableDetector:
             min_regions: minimum regions required to trigger alignment analysis per frame.
             method: assignment strategy ('center' or 'overlap').
             overlap_threshold: overlap threshold when using the 'overlap' method.
+            scale_factors: optional dict with resize scale to adjust tolerances.
 
         Returns:
             dict with keys:
@@ -1203,14 +1372,22 @@ class TextPositionTableDetector:
             analysis = {
                 'frame_id': entry['frame_id'],
                 'bbox': entry['bbox'],
+                'bbox_norm': entry.get('bbox_norm'),
                 'frame': entry['frame'],
                 'text_regions': frame_regions,
                 'text_count': len(frame_regions),
                 'alignment': {'rows': [], 'columns': []}
             }
+            if entry.get('scale_factors'):
+                analysis['scale_factors'] = entry['scale_factors']
 
             if len(frame_regions) >= min_regions:
-                alignment = self._analyze_text_alignment_fast(frame_regions, alignment_tolerance)
+                center_key = 'center_processed' if frame_regions and frame_regions[0].get('center_processed') is not None else 'center'
+                tolerance = alignment_tolerance
+                if center_key != 'center_processed' and scale_factors:
+                    scale_x = scale_factors.get('scale_x', 1.0) or 1.0
+                    tolerance = alignment_tolerance / scale_x
+                alignment = self._analyze_text_alignment_fast(frame_regions, tolerance, center_key=center_key)
                 analysis['alignment'] = alignment
                 analysis['row_count'] = len(alignment['rows'])
                 analysis['column_count'] = len(alignment['columns'])
@@ -1226,7 +1403,7 @@ class TextPositionTableDetector:
         }
     
     def detect_borderless_tables(self, image_path, alignment_tolerance=20, min_intersections=4, 
-                                save_visualization=True):
+                                save_visualization=True, target_long_side=None):
         """
         Main function to detect borderless tables based on text positions
         
@@ -1242,14 +1419,21 @@ class TextPositionTableDetector:
         print(f"Detecting borderless tables in: {image_path}")
         
         # Step 1: Extract text regions
-        text_regions = self._extract_text_regions(image_path)
+        text_regions = self._extract_text_regions(
+            image_path,
+            target_long_side=target_long_side or self.DEFAULT_MAX_LONG_SIDE
+        )
         
         if not text_regions:
             print("No text regions found!")
             return []
         
         # Step 2: Analyze text alignment
-        alignment_info = self._analyze_text_alignment_fast(text_regions, alignment_tolerance)
+        tolerance = alignment_tolerance
+        if self._last_resize_info:
+            scale_x = self._last_resize_info.get('scale_x', 1.0) or 1.0
+            tolerance = alignment_tolerance / scale_x
+        alignment_info = self._analyze_text_alignment_fast(text_regions, tolerance)
         
         # Step 3: Detect grid patterns
         tables = self._detect_grid_patterns(
